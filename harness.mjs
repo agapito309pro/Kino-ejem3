@@ -30,9 +30,12 @@ function curlFetch(url, options = {}) {
     status,
     url,
     headers: {},
-    text: async () => body,
-    json: async () => JSON.parse(body),
-    base64: async () => Buffer.from(body).toString("base64"),
+    // KinoResponse.text()/json()/base64() are SYNCHRONOUS in the app
+    // (kino.d.ts: text(): string). Keep them sync here so the harness has the
+    // same shape as the device runtime -- a .then() on them must fail here too.
+    text: () => body,
+    json: () => JSON.parse(body),
+    base64: () => Buffer.from(body).toString("base64"),
     truncated: false,
   };
 }

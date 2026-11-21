@@ -81,6 +81,8 @@ function timeToMs(text) {
 }
 
 // HTML page fetch. Returns the text or null (never throws: callers decide).
+// r.text() is sync in the app; await around it keeps the code correct in
+// either case (string or Promise).
 async function fetchText(url, timeoutMs) {
   await null;
   try {
@@ -95,7 +97,7 @@ async function fetchText(url, timeoutMs) {
     }
     return await r.text();
   } catch (e) {
-    log("fetch failed", e.code || e.message, url);
+    log("fetch failed", (e && (e.code || e.message)) || "error", url);
     return null;
   }
 }
@@ -319,25 +321,41 @@ function parseVideoPage(html) {
 
 // Verify candidate manifests in parallel and keep the first that answers
 // "#EXTM3U" (status 200). Never throws; returns null when none works.
+// IMPORTANT: KinoResponse.text() is SYNCHRONOUS in the app (it returns the
+// body string, not a Promise), so this never chains .then() on it -- await
+// works both here and under the Node harness. Every network call in the
+// plugin uses await + try/catch, never .then(), for the same reason.
+async function verifyMaster(url) {
+  await null;
+  try {
+    const r = await kino.fetch(url, {
+      headers: STREAM_HEADERS,
+      redirect: "follow",
+      timeoutMs: 8000,
+    });
+    if (!r.ok) {
+      log("manifest status", r.status, url);
+      return null;
+    }
+    const text = await r.text();
+    if (String(text).slice(0, 16).indexOf("#EXTM3U") === 0) {
+      return { url: url, manifest: String(text) };
+    }
+    log("manifest not m3u8", url);
+    return null;
+  } catch (e) {
+    log("manifest failed", (e && (e.code || e.message)) || "error", url);
+    return null;
+  }
+}
+
 async function verifyMasters(candidates) {
   await null;
   const asks = candidates.map(function (url) {
-    return kino
-      .fetch(url, { headers: STREAM_HEADERS, redirect: "follow", timeoutMs: 8000 })
-      .then(function (r) {
-        if (!r.ok) return null;
-        return r.text().then(function (text) {
-          const head = text.slice(0, 16);
-          if (head.indexOf("#EXTM3U") === 0) {
-            return { url: url, manifest: text };
-          }
-          return null;
-        });
-      })
-      .catch(function (e) {
-        log("manifest failed", e.code || e.message, url);
-        return null;
-      });
+    return verifyMaster(url).catch(function (e) {
+      log("manifest failed", (e && (e.code || e.message)) || "error", url);
+      return null;
+    });
   });
   const answers = await Promise.all(asks);
   for (const answer of answers) {
