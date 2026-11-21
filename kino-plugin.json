@@ -1,0 +1,14 @@
+{
+  "id": "njavtv",
+  "name": "nJAV",
+  "version": "1.0.3",
+  "apiVersion": 6,
+  "entry": "plugin.js",
+  "description": "Catálogo JAV de njavtv.com: populares de hoy, nuevos lanzamientos, actualizados recientemente, sin censura, FC2, subtitulados, más vistos y géneros. Contenido exclusivo para adultos (+18).",
+  "author": "Hotaru Yume",
+  "creator": "hotaruyume",
+  "hosts": ["njavtv.com", "surrit.com", "*.surrit.com"],
+  "capabilities": ["search", "home", "browse", "resolve"],
+  "color": "#FE628E",
+  "icon": "icon.png"
+}
