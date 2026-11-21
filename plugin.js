@@ -11,13 +11,16 @@
 // - The page HTML is cached by the site for up to 12 h and the CDN bucket can
 //   move, so resolve() verifies candidates in parallel (packer host first,
 //   then c./b./plain surrit.com) and plays the first manifest that answers
-//   "#EXTM3U". The same two headers (Referer + browser UA) the site's own
-//   player uses are sent with every player request — the stream comes back
-//   with signing: "request", so Kino routes every playlist and segment
-//   request through its local proxy and sign() re-attaches those headers
-//   each time. This matters because the surrit CDN refuses (403) any request
-//   without that Referer + a real User-Agent, and some TV players drop the
-//   stream headers on direct playback.
+//   "#EXTM3U". The surrit CDN sits behind a Cloudflare WAF that refuses (403)
+//   any request missing the site Referer, a real browser User-Agent or the
+//   __cf_bm bot-management cookie. kino.fetch sends the cookie from the
+//   plugin's jar (that is why the verification passes), but neither the
+//   player nor Kino's playback proxy shares that jar — so resolve() reads
+//   the cookie with kino.cookies.get() and sends it back on every player
+//   request: in the stream's headers and, via signContext, from sign()
+//   (signing: "request" plays everything through Kino's local proxy and
+//   re-applies the headers per request, which also fixes TV players that
+//   drop stream headers on direct playback).
 // - Ads (popunders, tsyndicate, myavlive, adsterra...) are never touched: the
 //   plugin reads only card markup and the packed video script, nothing else.
 //
@@ -324,6 +327,34 @@ function parseVideoPage(html) {
   return out;
 }
 
+// Cloudflare's bot-management cookie for the surrit domain. kino.fetch sends
+// it from the plugin's jar (that is why the verification fetch answers 200),
+// but the player and Kino's playback proxy do not share that jar and the
+// surrit WAF answers 403 to requests without it. Read it so the stream and
+// sign() can carry it. Null when the jar is empty or the API is missing.
+function cfCookie(url) {
+  try {
+    if (typeof kino.cookies === "object" && kino.cookies && typeof kino.cookies.get === "function") {
+      return (
+        kino.cookies.get(url, "__cf_bm") ||
+        kino.cookies.get("https://surrit.com/", "__cf_bm") ||
+        kino.cookies.get("https://c.surrit.com/", "__cf_bm") ||
+        null
+      );
+    }
+  } catch (e) {}
+  return null;
+}
+
+// Player headers for a stream: the CDN gate (Referer + real User-Agent) plus
+// the bot-management cookie when the jar has one. Sending the page's cookies
+// back as the stream's headers is Kino's own browser.capture pattern.
+function playerHeaders(cookie) {
+  const h = { "User-Agent": UA, "Referer": SITE + "/" };
+  if (cookie) h["Cookie"] = "__cf_bm=" + cookie;
+  return h;
+}
+
 // Verify candidate manifests in parallel and keep the first that answers
 // "#EXTM3U" (status 200). Never throws; returns null when none works.
 // IMPORTANT: KinoResponse.text() is SYNCHRONOUS in the app (it returns the
@@ -444,15 +475,22 @@ export async function resolve(ref) {
   }
   const variants = parseVariants(verified.manifest, verified.url);
   const verifiedHost = /^https:\/\/[^/]+/.exec(verified.url)[0].slice(8);
+  // The jar cookie that just made the verification fetch pass (read AFTER the
+  // fetches, so a fresh install already has one). Every resolve refreshes it,
+  // and expiresInSeconds makes Kino re-resolve before its ~30 min TTL ends.
+  const cookie = cfCookie(verified.url);
   const stream = {
     url: verified.url,
     mime: "application/x-mpegURL",
-    headers: STREAM_HEADERS,
+    headers: playerHeaders(cookie),
     // Play every playlist and segment through Kino's local proxy with sign()
     // (exported below) re-attaching the CDN gate headers per request: the
-    // surrit CDN answers 403 to any request without the Referer + browser
-    // UA, and some TV players drop the stream headers on direct playback.
+    // surrit WAF answers 403 to any request without Referer + browser UA +
+    // the Cloudflare cookie, and neither the player nor the proxy shares the
+    // plugin's cookie jar.
     signing: "request",
+    signContext: JSON.stringify({ cookie: cookie || "" }),
+    expiresInSeconds: 1800,
     label: "Surrit · Auto",
   };
   if (meta.durationMs > 0) stream.durationMs = meta.durationMs;
@@ -508,14 +546,27 @@ function swapHost(url, verifiedUrl) {
 // apiVersion 6, with the stream's signing: "request": headers for ONE player
 // request. Kino calls this for the master playlist, every variant playlist
 // and every segment (kind: "playlist" | "segment"), through its local proxy,
-// and sends these headers merged over the stream's own. The surrit CDN
-// refuses (403) any request without the site's Referer and a real
-// User-Agent, so every request must carry both. Static on purpose: sign()
-// runs in a restricted sandbox (no kino.fetch, no kino.storage, 1.5 s limit)
-// and these headers never change.
+// and sends these headers merged over the stream's own. The surrit WAF
+// (Cloudflare) refuses (403) any request without the site's Referer, a real
+// User-Agent and the __cf_bm bot-management cookie, so every request must
+// carry all three. The cookie travels in signContext (sign() can't read
+// kino.cookies there); resolve() refreshes it on every call and
+// expiresInSeconds (30 min, the cookie's own TTL) forces a re-resolve before
+// it can go stale. Static otherwise: sign() runs in a restricted sandbox
+// (no kino.fetch, no kino.storage, 1.5 s limit).
 export async function sign(request) {
   await null;
-  return { headers: STREAM_HEADERS };
+  const headers = { "User-Agent": UA, "Referer": SITE + "/" };
+  let cookie = "";
+  try {
+    const ctx =
+      request && typeof request.context === "string"
+        ? JSON.parse(request.context)
+        : null;
+    if (ctx && typeof ctx.cookie === "string") cookie = ctx.cookie;
+  } catch (e) {}
+  if (cookie) headers["Cookie"] = "__cf_bm=" + cookie;
+  return { headers: headers };
 }
 
 // "720p" from a .../720p/video.m3u8 URL, falling back to the manifest's names.

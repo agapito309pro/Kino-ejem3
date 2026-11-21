@@ -43,6 +43,14 @@ function curlFetch(url, options = {}) {
 globalThis.kino = {
   fetch: (url, options) => Promise.resolve(curlFetch(url, options)),
   log: (...args) => console.error("[kino.log]", ...args),
+  // The app's cookie jar: kino.fetch stores __cf_bm for surrit.com on the
+  // first 200 and the plugin replays it into the stream's player headers.
+  cookies: {
+    get: (url, name) =>
+      name === "__cf_bm" && /(^|\.)surrit\.com$/.test(new URL(url).hostname)
+        ? "harnesscfbmsamplevaluefortests"
+        : null,
+  },
   error: (code, message, extra) => {
     const e = new Error(`${code}: ${message}`);
     e.code = code;
