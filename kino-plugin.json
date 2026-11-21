@@ -1,7 +1,7 @@
 {
   "id": "njavtv",
   "name": "nJAV",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "apiVersion": 6,
   "entry": "plugin.js",
   "description": "Catálogo JAV de njavtv.com: populares de hoy, nuevos lanzamientos, actualizados recientemente, sin censura, FC2, subtitulados, más vistos y géneros. Contenido exclusivo para adultos (+18).",

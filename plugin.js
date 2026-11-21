@@ -12,7 +12,12 @@
 //   move, so resolve() verifies candidates in parallel (packer host first,
 //   then c./b./plain surrit.com) and plays the first manifest that answers
 //   "#EXTM3U". The same two headers (Referer + browser UA) the site's own
-//   player uses are sent with every player request.
+//   player uses are sent with every player request — the stream comes back
+//   with signing: "request", so Kino routes every playlist and segment
+//   request through its local proxy and sign() re-attaches those headers
+//   each time. This matters because the surrit CDN refuses (403) any request
+//   without that Referer + a real User-Agent, and some TV players drop the
+//   stream headers on direct playback.
 // - Ads (popunders, tsyndicate, myavlive, adsterra...) are never touched: the
 //   plugin reads only card markup and the packed video script, nothing else.
 //
@@ -438,13 +443,31 @@ export async function resolve(ref) {
     throw kino.error("unavailable", "ningún servidor de video respondió");
   }
   const variants = parseVariants(verified.manifest, verified.url);
+  const verifiedHost = /^https:\/\/[^/]+/.exec(verified.url)[0].slice(8);
   const stream = {
     url: verified.url,
     mime: "application/x-mpegURL",
     headers: STREAM_HEADERS,
+    // Play every playlist and segment through Kino's local proxy with sign()
+    // (exported below) re-attaching the CDN gate headers per request: the
+    // surrit CDN answers 403 to any request without the Referer + browser
+    // UA, and some TV players drop the stream headers on direct playback.
+    signing: "request",
     label: "Surrit · Auto",
   };
   if (meta.durationMs > 0) stream.durationMs = meta.durationMs;
+  // Other buckets serving the same path: Kino moves the playlist (and any
+  // failing segment) to them by itself while the stream is signed.
+  const otherHosts = candidateMasters(sources.master)
+    .map(function (u) {
+      return /^https:\/\/([^/]+)/.exec(u)[1];
+    })
+    .filter(function (h, i, all) {
+      return h !== verifiedHost && all.indexOf(h) === i;
+    });
+  if (otherHosts.length > 0) stream.alternateHosts = otherHosts.slice(0, 6);
+  // Fallback copies for runtimes that ignore per-request signing (the app
+  // also ignores these while the stream is signed).
   const alternatives = [];
   if (variants.length > 0) {
     alternatives.push({
@@ -480,6 +503,19 @@ function swapHost(url, verifiedUrl) {
   const verifiedHost = /^https:\/\/[^/]+/.exec(verifiedUrl)[0];
   const path = url.slice(/^https:\/\/[^/]+/.exec(url)[0].length);
   return verifiedHost + path;
+}
+
+// apiVersion 6, with the stream's signing: "request": headers for ONE player
+// request. Kino calls this for the master playlist, every variant playlist
+// and every segment (kind: "playlist" | "segment"), through its local proxy,
+// and sends these headers merged over the stream's own. The surrit CDN
+// refuses (403) any request without the site's Referer and a real
+// User-Agent, so every request must carry both. Static on purpose: sign()
+// runs in a restricted sandbox (no kino.fetch, no kino.storage, 1.5 s limit)
+// and these headers never change.
+export async function sign(request) {
+  await null;
+  return { headers: STREAM_HEADERS };
 }
 
 // "720p" from a .../720p/video.m3u8 URL, falling back to the manifest's names.

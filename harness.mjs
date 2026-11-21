@@ -80,6 +80,11 @@ if (arg === "home") {
 } else if (arg === "resolve") {
   const stream = await plugin.resolve(a1);
   console.log(JSON.stringify(stream, null, 1));
+} else if (arg === "sign") {
+  // Kino calls sign() for every playlist/segment request of a signed stream.
+  const req = typeof a1 === "string" && a1.trim().startsWith("{") ? JSON.parse(a1) : { url: a1 || "https://c.surrit.com/00000000-0000-0000-0000-000000000000/playlist.m3u8", kind: a2 || "playlist", ref: "test", context: "" };
+  const out = await plugin.sign(req);
+  console.log(JSON.stringify(out, null, 1));
 } else {
-  console.log("usage: node harness.mjs home | search <q> [cursor] | browse <ref> [cursor] | resolve <ref>");
+  console.log("usage: node harness.mjs home | search <q> [cursor] | browse <ref> [cursor] | resolve <ref> | sign [json|url] [kind]");
 }
