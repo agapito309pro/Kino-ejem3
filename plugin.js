@@ -1,76 +1,141 @@
-// Kino plugin: nJAV (njavtv.com) — free JAV streaming catalog.
-// Author: Hotaru Yume (creator: hotaruyume)
-//
-// How it works:
-// - Lists/search pages are plain HTML: cards carry a cover URL
-//   https://fourhoi.com/{dvd_id}/cover-t.jpg, a duration and the title.
-// - Each video page embeds its HLS source inside a Dean Edwards packed script
-//   (eval(function(p,a,c,k,e,d){...}('...',15,15,'words'.split('|'),0,{}))). We
-//   unpack it with plain string substitution (no eval) to get
-//   https://{surrit-host}/{uuid}/playlist.m3u8 plus direct variants.
-// - The page HTML is cached by the site for up to 12 h and the CDN bucket can
-//   move, so resolve() verifies candidates in parallel (packer host first,
-//   then c./b./plain surrit.com) and plays the first manifest that answers
-//   "#EXTM3U". The surrit CDN sits behind a Cloudflare WAF that refuses (403)
-//   any request missing the site Referer, a real browser User-Agent or the
-//   __cf_bm bot-management cookie. kino.fetch sends the cookie from the
-//   plugin's jar (that is why the verification passes), but neither the
-//   player nor Kino's playback proxy shares that jar — so resolve() reads
-//   the cookie with kino.cookies.get() and sends it back on every player
-//   request: in the stream's headers and, via signContext, from sign()
-//   (signing: "request" plays everything through Kino's local proxy and
-//   re-applies the headers per request, which also fixes TV players that
-//   drop stream headers on direct playback).
-// - Ads (popunders, tsyndicate, myavlive, adsterra...) are never touched: the
-//   plugin reads only card markup and the packed video script, nothing else.
-//
-// All items are marked adult: true (apiVersion 6): Kino shows them only while
-// the person's 18+ code is unlocked on that device.
+// nJAV Kino plugin — Hotaru Yume / hotaruyume
+// v1.0.4: optional hlsProxy (Deno Deploy) for Android TV / surrit WAF
 
-// Generic browser user agent: njavtv.com and the video CDN both answer fine to
-// a real browser and are picky with unknown clients.
 const UA =
   "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36";
 const SITE = "https://njavtv.com";
 const IMG = "https://fourhoi.com";
 
-// Headers for HTML page fetches (lists, search, video pages).
 const PAGE_HEADERS = {
   "User-Agent": UA,
   "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
   "Accept-Language": "en-US,en;q=0.9",
 };
 
-// Headers the video player must send on every request (manifest, variants,
-// segments): without the Referer the CDN refuses the manifest.
 const STREAM_HEADERS = {
   "User-Agent": UA,
   "Referer": SITE + "/",
 };
 
-// Known CDN buckets for the same object path (the page cache may be stale).
 const STREAM_HOSTS = ["c.surrit.com", "surrit.com", "b.surrit.com"];
 
-// Kino drops repeated ids and caps every answer; these are the site page
-// counts we join per call (12 cards per site page, so 8 pages = 96 items).
+function hlsProxyBase() {
+  try {
+    const raw = String(kino.config.get("hlsProxy") || "").trim().replace(/\/+$/, "");
+    if (!raw) return "";
+    if (!/^https?:\/\//i.test(raw)) return "";
+    const u = new URL(raw);
+    if (u.protocol !== "https:" && u.protocol !== "http:") return "";
+    return u.origin;
+  } catch (e) {
+    return "";
+  }
+}
+
+function extractCookieFromHeaders(headers) {
+  if (!headers) return "";
+  if (typeof headers === "object" && !Array.isArray(headers)) {
+    const c = headers.Cookie || headers.cookie || "";
+    if (typeof c === "string" && c) {
+      const m = /__cf_bm=([^;]+)/.exec(c);
+      return m ? m[1] : c;
+    }
+  }
+  return "";
+}
+
+function maybeProxyUrl(directUrl, pageUrl, cookie) {
+  const worker = hlsProxyBase();
+  if (!worker || !directUrl) return directUrl;
+  if (String(directUrl).indexOf(worker) === 0) return directUrl;
+  const low = String(directUrl).toLowerCase();
+  const isCdn =
+    /\.(m3u8|m3u)(\?|$)/i.test(low) ||
+    /(surrit|sixyik|nineyu|fourhoi)\.com/i.test(low);
+  if (!isCdn) return directUrl;
+  const ref = pageUrl || SITE + "/";
+  let orig = SITE;
+  try {
+    orig = new URL(ref).origin;
+  } catch (e) {}
+  const u = new URL(worker + "/playlist.m3u8");
+  u.searchParams.set("url", directUrl);
+  u.searchParams.set("ref", ref);
+  u.searchParams.set("orig", orig);
+  if (cookie) {
+    try {
+      u.searchParams.set("ck", cookie);
+    } catch (e) {}
+  }
+  return u.toString();
+}
+
+function proxyStream(stream, pageUrl) {
+  if (!stream || !stream.url) return stream;
+  const worker = hlsProxyBase();
+  if (!worker) {
+    log("proxy OFF (hlsProxy vacío — en TV configura Deno Deploy en Ajustes)");
+    return stream;
+  }
+  const cookie =
+    extractCookieFromHeaders(stream.headers) ||
+    (stream.signContext
+      ? (function () {
+          try {
+            const ctx = JSON.parse(stream.signContext);
+            return (ctx && ctx.cookie) || "";
+          } catch (e) {
+            return "";
+          }
+        })()
+      : "");
+  const page = pageUrl || SITE + "/";
+  const proxied = maybeProxyUrl(stream.url, page, cookie);
+  if (proxied === stream.url) {
+    log("proxy: URL no es CDN, se deja directa", String(stream.url).slice(0, 80));
+    return stream;
+  }
+  log("proxy ON", proxied.slice(0, 120), "cookie?", !!cookie);
+  const out = {
+    url: proxied,
+    mime: stream.mime || "application/x-mpegURL",
+    label: stream.label ? stream.label + " · proxy" : "Surrit · proxy",
+  };
+  if (stream.durationMs > 0) out.durationMs = stream.durationMs;
+  out.headers = {
+    "User-Agent": UA,
+    Accept: "*/*",
+  };
+  if (Array.isArray(stream.alternatives) && stream.alternatives.length) {
+    out.alternatives = stream.alternatives.map(function (a) {
+      if (!a || !a.url) return a;
+      return {
+        url: maybeProxyUrl(a.url, page, cookie),
+        label: a.label ? a.label + " · proxy" : "alt · proxy",
+        mime: a.mime || "application/x-mpegURL",
+        headers: out.headers,
+      };
+    });
+  }
+  return out;
+}
+
 const PAGES_PER_ANSWER = 8;
-const CARDS_PER_ROW = 2; // pages joined per Home row (24 items)
+const CARDS_PER_ROW = 2;
 
 function log() {
   try {
     kino.log.apply(null, arguments);
-  } catch (e) {
-    // a log line is never worth the call
-  }
+  } catch (e) {}
 }
 
 function decodeEntities(text) {
   return String(text)
-    .replace(/&amp;/g, "&")
-    .replace(/&quot;/g, '"')
-    .replace(/&#0?39;|&apos;|&#x0?27;/gi, "'")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
+    .replace(/&/g, "&")
+    .replace(/"/g, '"')
+    .replace(/&#0?39;|'|&#x0?27;/gi, "'")
+    .replace(/</g, "<")
+    .replace(/>/g, ">")
     .replace(/&nbsp;/g, " ")
     .replace(/&hellip;/gi, "…");
 }
@@ -79,7 +144,6 @@ function clean(text) {
   return decodeEntities(String(text).replace(/\s+/g, " ")).trim();
 }
 
-// "2:31:01" or "45:09" → milliseconds; 0 when unparseable.
 function timeToMs(text) {
   const parts = String(text || "").trim().split(":");
   if (!parts.every((p) => /^\d+$/.test(p))) return 0;
@@ -88,9 +152,6 @@ function timeToMs(text) {
   return seconds > 0 ? seconds * 1000 : 0;
 }
 
-// HTML page fetch. Returns the text or null (never throws: callers decide).
-// r.text() is sync in the app; await around it keeps the code correct in
-// either case (string or Promise).
 async function fetchText(url, timeoutMs) {
   await null;
   try {
@@ -110,8 +171,6 @@ async function fetchText(url, timeoutMs) {
   }
 }
 
-// Dean Edwards packer, unpacked without eval: tokens are base-36 indexes into
-// the word list, replaced by word boundaries on both sides.
 function unpackPacked(packed, words) {
   let text = packed;
   for (let c = words.length - 1; c >= 0; c--) {
@@ -119,7 +178,6 @@ function unpackPacked(packed, words) {
     if (!word) continue;
     const token = c.toString(36);
     const pattern = new RegExp("\\b" + token + "\\b", "g");
-    // a function replacement keeps '$' in words literal
     text = text.replace(pattern, function () {
       return word;
     });
@@ -127,9 +185,6 @@ function unpackPacked(packed, words) {
   return text;
 }
 
-// Extract the video sources of a video page:
-// { master, high, low } (all absolute https URLs) or null when the page has no
-// packed script (gone video, redirect to the home page, or a list page).
 function videoSources(html) {
   if (!html) return null;
   const call = /eval\(function\(p,a,c,k,e,d\)\{[\s\S]*?\}\('([\s\S]*?)',(\d+),(\d+),'([\s\S]*?)'\.split\('\|'\)/.exec(
@@ -139,9 +194,6 @@ function videoSources(html) {
   const words = call[4].split("|");
   const code = unpackPacked(call[1], words);
   const urls = {};
-  // source='https://host/uuid/playlist.m3u8';source842='...'; — quotes are
-  // escaped in the packed code (=\'…\'), so allow a backslash around them and
-  // strip every backslash from the value.
   const assigns = code.match(/[A-Za-z0-9_$]+\s*=\s*\\?'[^']*\\?'/g) || [];
   for (const a of assigns) {
     const pair = /^([A-Za-z0-9_$]+)\s*=\s*\\?'([^']*)\\?'$/.exec(a);
@@ -154,16 +206,12 @@ function videoSources(html) {
   }
   const master = urls.source || null;
   if (!master) return null;
-  const high = urls.source1280 || null;
-  const low = urls.source842 || null;
-  return { master: master, high: high, low: low };
+  return { master: master, high: urls.source1280 || null, low: urls.source842 || null };
 }
 
-// Candidate master URLs: the page's own host first (what the site's player
-// uses), then the same {uuid}/playlist.m3u8 on the other known buckets.
 function candidateMasters(master) {
   const cut = master.indexOf("://");
-  const rest = master.slice(cut + 3); // host/uuid/playlist.m3u8
+  const rest = master.slice(cut + 3);
   const slash = rest.indexOf("/");
   const host = rest.slice(0, slash);
   const path = rest.slice(slash + 1);
@@ -174,8 +222,6 @@ function candidateMasters(master) {
   return out;
 }
 
-// Read a verified master manifest into its direct variants (best first):
-// [{ name: "1080p", url: ".../1080p/video.m3u8" }, ...]
 function parseVariants(manifest, masterUrl) {
   const out = [];
   const base = masterUrl.slice(0, masterUrl.lastIndexOf("/") + 1);
@@ -203,8 +249,6 @@ function parseVariants(manifest, masterUrl) {
   return out;
 }
 
-// One card of a list page. The slug is the stable id/ref: video pages answer
-// on /{slug}, /dm{n}/{slug} and /en/{slug} alike.
 function toItem(slug, title, duration, extra) {
   const item = {
     id: slug,
@@ -220,7 +264,6 @@ function toItem(slug, title, duration, extra) {
   return item;
 }
 
-// Parse the cards of a list/search page: cover slug, duration, title.
 function parseCards(html) {
   const out = [];
   const seen = {};
@@ -243,20 +286,15 @@ function parseCards(html) {
   return out;
 }
 
-// Fetch one list page and parse its cards; null on any failure.
 async function fetchListPage(path, page) {
   await null;
   let url = SITE + path;
   if (page && page > 1) url += "?page=" + page;
   const html = await fetchText(url);
   if (!html) return null;
-  const items = parseCards(html);
-  return items;
+  return parseCards(html);
 }
 
-// Join several consecutive site pages into one answer (max 8 pages = 96
-// items, the most Kino accepts per answer). next continues at the page after
-// the last one fetched while every page came back full (12 cards).
 async function joinPages(path, startPage, pageCount) {
   await null;
   const asks = [];
@@ -286,10 +324,6 @@ async function joinPages(path, startPage, pageCount) {
   return result;
 }
 
-// ---- Home rows --------------------------------------------------------------
-
-// Each row: the id (also the "Ver más" browse ref, ASCII only), the Spanish
-// title, the site path (without ?page=) and whether the site paginates it.
 const ROWS = [
   { id: "hoy", title: "Populares de hoy", path: "/en/today-hot", pages: true },
   { id: "nuevos", title: "Nuevos lanzamientos", path: "/en/release", pages: true },
@@ -314,7 +348,6 @@ function rowById(ref) {
   return null;
 }
 
-// Video page metadata: title, poster, duration.
 function parseVideoPage(html) {
   const out = {};
   if (!html) return out;
@@ -327,11 +360,6 @@ function parseVideoPage(html) {
   return out;
 }
 
-// Cloudflare's bot-management cookie for the surrit domain. kino.fetch sends
-// it from the plugin's jar (that is why the verification fetch answers 200),
-// but the player and Kino's playback proxy do not share that jar and the
-// surrit WAF answers 403 to requests without it. Read it so the stream and
-// sign() can carry it. Null when the jar is empty or the API is missing.
 function cfCookie(url) {
   try {
     if (typeof kino.cookies === "object" && kino.cookies && typeof kino.cookies.get === "function") {
@@ -346,21 +374,12 @@ function cfCookie(url) {
   return null;
 }
 
-// Player headers for a stream: the CDN gate (Referer + real User-Agent) plus
-// the bot-management cookie when the jar has one. Sending the page's cookies
-// back as the stream's headers is Kino's own browser.capture pattern.
 function playerHeaders(cookie) {
   const h = { "User-Agent": UA, "Referer": SITE + "/" };
   if (cookie) h["Cookie"] = "__cf_bm=" + cookie;
   return h;
 }
 
-// Verify candidate manifests in parallel and keep the first that answers
-// "#EXTM3U" (status 200). Never throws; returns null when none works.
-// IMPORTANT: KinoResponse.text() is SYNCHRONOUS in the app (it returns the
-// body string, not a Promise), so this never chains .then() on it -- await
-// works both here and under the Node harness. Every network call in the
-// plugin uses await + try/catch, never .then(), for the same reason.
 async function verifyMaster(url) {
   await null;
   try {
@@ -439,8 +458,6 @@ export async function browse(ref, cursor) {
     if (page === 1) throw kino.error("unavailable", "njavtv.com no respondió");
     throw kino.error("not_found", "no hay más resultados");
   }
-  // today-hot and friends: when the site stops answering at the cursor page
-  // the chain ends (joinPages only sets next while pages come back full).
   return { items: result.items.slice(0, 100), next: result.next };
 }
 
@@ -475,27 +492,17 @@ export async function resolve(ref) {
   }
   const variants = parseVariants(verified.manifest, verified.url);
   const verifiedHost = /^https:\/\/[^/]+/.exec(verified.url)[0].slice(8);
-  // The jar cookie that just made the verification fetch pass (read AFTER the
-  // fetches, so a fresh install already has one). Every resolve refreshes it,
-  // and expiresInSeconds makes Kino re-resolve before its ~30 min TTL ends.
   const cookie = cfCookie(verified.url);
   const stream = {
     url: verified.url,
     mime: "application/x-mpegURL",
     headers: playerHeaders(cookie),
-    // Play every playlist and segment through Kino's local proxy with sign()
-    // (exported below) re-attaching the CDN gate headers per request: the
-    // surrit WAF answers 403 to any request without Referer + browser UA +
-    // the Cloudflare cookie, and neither the player nor the proxy shares the
-    // plugin's cookie jar.
     signing: "request",
     signContext: JSON.stringify({ cookie: cookie || "" }),
     expiresInSeconds: 1800,
     label: "Surrit · Auto",
   };
   if (meta.durationMs > 0) stream.durationMs = meta.durationMs;
-  // Other buckets serving the same path: Kino moves the playlist (and any
-  // failing segment) to them by itself while the stream is signed.
   const otherHosts = candidateMasters(sources.master)
     .map(function (u) {
       return /^https:\/\/([^/]+)/.exec(u)[1];
@@ -504,8 +511,6 @@ export async function resolve(ref) {
       return h !== verifiedHost && all.indexOf(h) === i;
     });
   if (otherHosts.length > 0) stream.alternateHosts = otherHosts.slice(0, 6);
-  // Fallback copies for runtimes that ignore per-request signing (the app
-  // also ignores these while the stream is signed).
   const alternatives = [];
   if (variants.length > 0) {
     alternatives.push({
@@ -513,8 +518,6 @@ export async function resolve(ref) {
       label: "Surrit · " + variants[0].name,
     });
   }
-  // The packer's direct variant (what the site's own fallback uses), when it
-  // is not already the top variant we listed.
   if (sources.high) {
     const swapped = swapHost(sources.high, verified.url);
     const name = variantName(swapped, variants);
@@ -533,27 +536,18 @@ export async function resolve(ref) {
     }
   }
   if (alternatives.length > 0) stream.alternatives = alternatives.slice(0, 8);
+  if (hlsProxyBase()) {
+    return proxyStream(stream, SITE + "/");
+  }
   return stream;
 }
 
-// Rebuild a packer URL on the host that verified.
 function swapHost(url, verifiedUrl) {
   const verifiedHost = /^https:\/\/[^/]+/.exec(verifiedUrl)[0];
   const path = url.slice(/^https:\/\/[^/]+/.exec(url)[0].length);
   return verifiedHost + path;
 }
 
-// apiVersion 6, with the stream's signing: "request": headers for ONE player
-// request. Kino calls this for the master playlist, every variant playlist
-// and every segment (kind: "playlist" | "segment"), through its local proxy,
-// and sends these headers merged over the stream's own. The surrit WAF
-// (Cloudflare) refuses (403) any request without the site's Referer, a real
-// User-Agent and the __cf_bm bot-management cookie, so every request must
-// carry all three. The cookie travels in signContext (sign() can't read
-// kino.cookies there); resolve() refreshes it on every call and
-// expiresInSeconds (30 min, the cookie's own TTL) forces a re-resolve before
-// it can go stale. Static otherwise: sign() runs in a restricted sandbox
-// (no kino.fetch, no kino.storage, 1.5 s limit).
 export async function sign(request) {
   await null;
   const headers = { "User-Agent": UA, "Referer": SITE + "/" };
@@ -569,7 +563,6 @@ export async function sign(request) {
   return { headers: headers };
 }
 
-// "720p" from a .../720p/video.m3u8 URL, falling back to the manifest's names.
 function variantName(url, variants) {
   const m = /\/(\d+p)\/[^/]+\.m3u8$/.exec(url);
   if (m) return m[1];
