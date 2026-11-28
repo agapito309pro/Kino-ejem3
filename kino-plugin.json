@@ -1,14 +1,24 @@
 {
   "id": "njavtv",
   "name": "nJAV",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "apiVersion": 6,
   "entry": "plugin.js",
-  "description": "Catálogo JAV de njavtv.com: populares de hoy, nuevos lanzamientos, actualizados recientemente, sin censura, FC2, subtitulados, más vistos y géneros. Contenido exclusivo para adultos (+18).",
+  "description": "Catálogo JAV de njavtv.com: populares de hoy, nuevos lanzamientos, actualizados recientemente, sin censura, FC2, subtitulados, más vistos y géneros. Contenido exclusivo para adultos (+18). Android TV: configura Proxy HLS (Deno Deploy) en Ajustes del plugin.",
   "author": "Hotaru Yume",
   "creator": "hotaruyume",
-  "hosts": ["njavtv.com", "surrit.com", "*.surrit.com"],
+  "hosts": ["njavtv.com", "surrit.com", "*.surrit.com", "fourhoi.com", "*.fourhoi.com"],
+  "streamHosts": "any",
   "capabilities": ["search", "home", "browse", "resolve"],
   "color": "#FE628E",
-  "icon": "icon.png"
+  "icon": "icon.png",
+  "categories": ["adult"],
+  "settings": [
+    {
+      "key": "hlsProxy",
+      "label": "Proxy HLS (Android TV)",
+      "type": "url",
+      "hint": "https://xxxx.deno.dev — vacío = directo (signing local)"
+    }
+  ]
 }
